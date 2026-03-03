@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import requests
 from feedgen.feed import FeedGenerator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import time
@@ -58,7 +58,7 @@ class PermitRSSBuilder:
 
     def fetch(self, city_key, days=7, limit=100):
         city = self.cities[city_key]
-        cutoff = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d')
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%d')
 
         params = {
             "$limit": limit,
@@ -131,7 +131,7 @@ class PermitRSSBuilder:
         fg.title("Permit Intelligence Feed")
         fg.link(href="https://example.com")
         fg.description("Structured permit intelligence feed")
-        fg.lastBuildDate(datetime.utcnow())
+        fg.lastBuildDate(datetime.now(timezone.utc))
 
         for item in data:
             fe = fg.add_entry()
@@ -143,7 +143,7 @@ class PermitRSSBuilder:
                 f"Tags: {', '.join(item['arbitrage_tags'])}"
             )
             fe.guid(f"{item['city']}-{item['issued_date']}-{item['address']}")
-            fe.pubDate(datetime.utcnow())
+            fe.pubDate(datetime.now(timezone.utc))
 
         fg.rss_file(filename)
 
