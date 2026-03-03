@@ -26,57 +26,244 @@ SOURCES = [
         "url": os.environ.get(
             "CHICAGO_PERMIT_URL", "https://data.cityofchicago.org/resource/ydr8-5enu.json"
         ),
-        "date_field": os.environ.get("CHICAGO_DATE_FIELD", "issued_date"),
+        # Verified field name from dataset metadata: ISSUE_DATE -> fieldName: issue_date
+        "date_field": os.environ.get("CHICAGO_DATE_FIELD", "issue_date"),
     },
     {
         "name": "San Francisco",
         "url": os.environ.get(
-            "SF_PERMIT_URL", "https://data.sfgov.org/resource/6a7x-dm8c.json"
+            "SF_PERMIT_URL", "https://data.sfgov.org/resource/i98e-djp9.json"
         ),
+        # Verified field name from dataset metadata: Issued Date -> issued_date
         "date_field": os.environ.get("SF_DATE_FIELD", "issued_date"),
     },
 ]
 
 
 def iso_since(days: int = 7) -> str:
-    """Return an ISO8601 timestamp `days` ago (timezone-aware)."""
-    since = datetime.now(timezone.utc) - timedelta(days=days)
-    return since.isoformat()
+    """Return a Socrata-friendly ISO datetime string for midnight `days` ago.
+
+    Format: YYYY-MM-DDT00:00:00 (no timezone offset) to match Socrata $where expectations.
+    Uses timezone-aware now to compute the date, then emits a date-only timestamp at 00:00:00.
+    """
+    since_dt = datetime.now(timezone.utc) - timedelta(days=days)
+    since_date = since_dt.date()
+    return f"{since_date.isoformat()}T00:00:00"
 
 
 def fetch_permits(source: Dict[str, str], since_iso: str, limit: int = 10000) -> List[Dict[str, Any]]:
-    """Fetch permits from a Socrata-like endpoint.
+    """Fetch permits and normalize to a consistent minimal schema.
 
-    The function is defensive: network errors or bad responses return an empty list.
+    Uses Socrata `$select` to request only candidate fields, then normalizes each
+    record into the schema requested by the product:
+
+      { city, permit_id, permit_type, description, value, issued_date, address }
+
+    The function is intentionally minimal and does no retries.
     """
     url = source.get("url")
     date_field = source.get("date_field")
+
+    # Use source-specific safe select lists to avoid Socrata rejecting unknown columns
+    if source.get("name") == "Chicago":
+        # Verified fields from Chicago dataset
+        select_fields = ",".join([
+            "id",
+            "permit_",
+            "permit_type",
+            "work_description",
+            "issue_date",
+            "reported_cost",
+            "street_number",
+            "street_name",
+            "street_direction",
+            "street_suffix",
+        ])
+    elif source.get("name") == "San Francisco":
+        # Verified fields from SF dataset
+        select_fields = ",".join([
+            "permit_number",
+            "permit_type",
+            "description",
+            "issued_date",
+            "estimated_cost",
+            "primary_address",
+            "street_number",
+            "street_name",
+        ])
+    else:
+        # fallback - minimal safe fields
+        select_fields = ",".join(["id", "permit_", "permit_number", date_field])
+
+    where_clause = f"{date_field} >= '{since_iso}'"
     params = {
-        "$where": f"{date_field} >= '{since_iso}'",
+        "$select": select_fields,
+        "$where": where_clause,
         "$limit": limit,
         "$order": f"{date_field} DESC",
     }
+
     headers = {"Accept": "application/json"}
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
         resp.raise_for_status()
         data = resp.json()
-        if isinstance(data, list):
-            return data
-        # If the API wraps results, try to extract a list safely.
-        if isinstance(data, dict):
-            # common Socrata responses are lists; fall back to values
-            for v in data.values():
-                if isinstance(v, list):
-                    return v
-        print(f"[warn] Unexpected response format from {source.get('name')}", file=sys.stderr)
-        return []
+    except requests.HTTPError as exc:
+        # If $select causes a 400, fall back to requesting without $select (minimal retry).
+        status = getattr(exc.response, "status_code", None)
+        if status == 400 and "$select" in params:
+            try:
+                params.pop("$select", None)
+                resp = requests.get(url, params=params, headers=headers, timeout=20)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc2:
+                print(f"[error] Failed to fetch {source.get('name')} after dropping $select: {exc2}", file=sys.stderr)
+                return []
+        else:
+            print(f"[error] HTTP error fetching {source.get('name')}: {exc}", file=sys.stderr)
+            return []
     except requests.RequestException as exc:
         print(f"[error] Failed to fetch {source.get('name')}: {exc}", file=sys.stderr)
         return []
     except ValueError as exc:
         print(f"[error] Invalid JSON from {source.get('name')}: {exc}", file=sys.stderr)
         return []
+
+    if not isinstance(data, list):
+        # try to extract list if API wrapped result
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    data = v
+                    break
+        if not isinstance(data, list):
+            print(f"[warn] Unexpected response format from {source.get('name')}", file=sys.stderr)
+            return []
+
+    normalized: List[Dict[str, Any]] = []
+    for raw in data:
+        # helper to pick first available field from candidates
+        def pick(*keys):
+            for k in keys:
+                if k in raw and raw.get(k) not in (None, ""):
+                    return raw.get(k)
+            return None
+
+        pid = pick("permit_", "permit_number", "id") or None
+        ptype = pick("permit_type", "Permit Type")
+        desc = pick("work_description", "description")
+        value = pick("reported_cost", "estimated_cost")
+        # Normalize issued_date: attempt to parse and emit RFC3339 with timezone
+        issued_raw = pick(date_field, "issue_date", "issued_date")
+        issued_norm = None
+        if isinstance(issued_raw, str):
+            try:
+                parsed = datetime.fromisoformat(issued_raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                issued_norm = parsed.isoformat()
+            except Exception:
+                # leave original string if parsing fails
+                issued_norm = issued_raw
+        elif isinstance(issued_raw, datetime):
+            dt = issued_raw
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            issued_norm = dt.isoformat()
+
+        # Build a compact address string from available parts
+        addr = pick("address", "primary_address")
+        if not addr:
+            sn = pick("street_number") or ""
+            sname = pick("street_name") or ""
+            sfx = pick("street_suffix") or ""
+            sdir = pick("street_direction") or ""
+            parts = [sn, sdir, sname, sfx]
+            addr = " ".join([p for p in parts if p]) or None
+
+        # ensure permit_id present and also set 'id' for backward compatibility
+        permit_id = pid or f"{source.get('name')}-{pick('id') or ''}"
+
+        # compute numeric value safely
+        num_value = None
+        if isinstance(value, (int, float)):
+            try:
+                num_value = float(value)
+            except Exception:
+                num_value = None
+        elif isinstance(value, str):
+            try:
+                cleaned = value.replace("$", "").replace(",", "").strip()
+                if cleaned != "":
+                    num_value = float(cleaned)
+            except Exception:
+                num_value = None
+
+        # intelligence fields
+        is_high_value = bool(num_value is not None and num_value >= 250000)
+
+        # deal_score: tiered base (not additive) for value, plus keyword boosts
+        deal_score = 0
+        if num_value is not None:
+            if num_value >= 1000000:
+                deal_score = 8
+            elif num_value >= 250000:
+                deal_score = 3
+
+        dlow = (desc or "").lower()
+        if "new" in dlow or "addition" in dlow:
+            deal_score += 2
+        if "commercial" in dlow:
+            deal_score += 2
+
+        # vertical tags mapping (deterministic)
+        vertical_tags: List[str] = []
+        def add_tag(t: str):
+            if t not in vertical_tags:
+                vertical_tags.append(t)
+
+        if "roof" in dlow:
+            add_tag("Roofing")
+        if "solar" in dlow:
+            add_tag("Solar")
+        if "electrical" in dlow:
+            add_tag("Electrical")
+        if "hvac" in dlow:
+            add_tag("HVAC")
+        if "demolition" in dlow or "demo" in dlow:
+            add_tag("Demolition")
+        if "new" in dlow:
+            add_tag("New Construction")
+
+        # primary_vertical: first matched tag or 'General'
+        primary_vertical = vertical_tags[0] if vertical_tags else "General"
+
+        # opportunity_class based on tiers
+        if num_value is not None and num_value >= 1000000:
+            opportunity_class = "MAJOR"
+        elif num_value is not None and num_value >= 250000:
+            opportunity_class = "MID"
+        else:
+            opportunity_class = "MINOR"
+
+        normalized.append({
+            "city": source.get("name"),
+            "permit_id": permit_id,
+            "id": permit_id,
+            "permit_type": ptype,
+            "description": desc,
+            "value": num_value,
+            "issued_date": issued_norm,
+            "address": addr,
+            "is_high_value": is_high_value,
+            "deal_score": deal_score,
+            "vertical_tags": vertical_tags,
+            "primary_vertical": primary_vertical,
+            "opportunity_class": opportunity_class,
+        })
+
+    return normalized
 
 
 def build_feed(all_records: List[Dict[str, Any]]) -> FeedGenerator:
@@ -91,6 +278,11 @@ def build_feed(all_records: List[Dict[str, Any]]) -> FeedGenerator:
 
     for rec in all_records:
         try:
+            # Ensure any datetime objects inside the record are timezone-aware
+            for k, v in list(rec.items()):
+                if isinstance(v, datetime) and v.tzinfo is None:
+                    rec[k] = v.replace(tzinfo=timezone.utc)
+
             entry = fg.add_entry()
             # Use stable, deterministic id if available, else fallback to an index-like id
             rec_id = rec.get("id") or rec.get("permit_number") or rec.get("permit") or rec.get("case_number")
@@ -125,15 +317,34 @@ def write_outputs(fg: FeedGenerator, records: List[Dict[str, Any]], xml_path: st
         print(f"[error] Failed to write XML feed: {exc}", file=sys.stderr)
 
     try:
-        # Create a compact JSON feed with some fields for each record.
-        minimal = []
-        for r in records:
-            minimal.append({
-                "id": r.get("id") or r.get("permit_number") or r.get("case_number"),
-                "source": r.get("agency") or r.get("source") or None,
-                "summary": r.get("description") or r.get("permit_type") or r.get("address"),
-                "raw": r,
-            })
+        # If records are normalized (have 'permit_id'), emit a clean, consistent schema.
+        minimal: List[Dict[str, Any]] = []
+        if records and isinstance(records, list) and records[0].get("permit_id") is not None:
+            for r in records:
+                minimal.append({
+                    "city": r.get("city"),
+                    "permit_id": r.get("permit_id"),
+                    "permit_type": r.get("permit_type"),
+                    "description": r.get("description"),
+                    "value": r.get("value"),
+                    "issued_date": r.get("issued_date"),
+                    "address": r.get("address"),
+                    "is_high_value": r.get("is_high_value"),
+                    "deal_score": r.get("deal_score"),
+                    "vertical_tags": r.get("vertical_tags"),
+                    "primary_vertical": r.get("primary_vertical"),
+                    "opportunity_class": r.get("opportunity_class"),
+                })
+        else:
+            # Backwards-compatible minimal extraction
+            for r in records:
+                minimal.append({
+                    "id": r.get("id") or r.get("permit_number") or r.get("case_number"),
+                    "source": r.get("agency") or r.get("source") or None,
+                    "summary": r.get("description") or r.get("permit_type") or r.get("address"),
+                    "raw": r,
+                })
+
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump({"generated_at": datetime.now(timezone.utc).isoformat(), "items": minimal}, fh, ensure_ascii=False, indent=2)
     except Exception as exc:
