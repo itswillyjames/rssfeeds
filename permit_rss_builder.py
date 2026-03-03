@@ -317,36 +317,12 @@ def write_outputs(fg: FeedGenerator, records: List[Dict[str, Any]], xml_path: st
         print(f"[error] Failed to write XML feed: {exc}", file=sys.stderr)
 
     try:
-        # If records are normalized (have 'permit_id'), emit a clean, consistent schema.
-        minimal: List[Dict[str, Any]] = []
-        if records and isinstance(records, list) and records[0].get("permit_id") is not None:
-            for r in records:
-                minimal.append({
-                    "city": r.get("city"),
-                    "permit_id": r.get("permit_id"),
-                    "permit_type": r.get("permit_type"),
-                    "description": r.get("description"),
-                    "value": r.get("value"),
-                    "issued_date": r.get("issued_date"),
-                    "address": r.get("address"),
-                    "is_high_value": r.get("is_high_value"),
-                    "deal_score": r.get("deal_score"),
-                    "vertical_tags": r.get("vertical_tags"),
-                    "primary_vertical": r.get("primary_vertical"),
-                    "opportunity_class": r.get("opportunity_class"),
-                })
-        else:
-            # Backwards-compatible minimal extraction
-            for r in records:
-                minimal.append({
-                    "id": r.get("id") or r.get("permit_number") or r.get("case_number"),
-                    "source": r.get("agency") or r.get("source") or None,
-                    "summary": r.get("description") or r.get("permit_type") or r.get("address"),
-                    "raw": r,
-                })
-
+        # Write the enhanced normalized records directly. The records list already
+        # contains the enhanced schema (city, permit_id, permit_type, description,
+        # value, issued_date, address, is_high_value, deal_score, vertical_tags,
+        # primary_vertical, opportunity_class).
         with open(json_path, "w", encoding="utf-8") as fh:
-            json.dump({"generated_at": datetime.now(timezone.utc).isoformat(), "items": minimal}, fh, ensure_ascii=False, indent=2)
+            json.dump({"generated_at": datetime.now(timezone.utc).isoformat(), "items": records}, fh, ensure_ascii=False, indent=2)
     except Exception as exc:
         print(f"[error] Failed to write JSON feed: {exc}", file=sys.stderr)
 
