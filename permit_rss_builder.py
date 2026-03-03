@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import requests
 from feedgen.feed import FeedGenerator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, timezone
 import json
 import os
 import time
